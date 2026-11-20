@@ -1,0 +1,170 @@
+# =============================================================================
+# Cloud Run service definition (Knative Serving v1 schema).
+#
+# Deploy with:
+#   gcloud run services replace deploy/service.yaml --region europe-west3
+#
+# Cloud Build does this automatically via deploy/cloudbuild.yaml (it rewrites
+# the PROJECT_ID placeholder and the `:latest` tag to the immutable BUILD_ID).
+#
+# Public access (allUsers → roles/run.invoker) is not part of this file: IAM
+# bindings are set separately. Cloud Build grants it on every deploy; after a
+# manual `replace`, grant it once:
+#   gcloud run services add-iam-policy-binding agentic-ai-engineering \
+#     --region=europe-west3 --member=allUsers --role=roles/run.invoker
+# =============================================================================
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: agentic-ai-engineering
+  labels:
+    cloud.googleapis.com/location: europe-west3
+    app: agentic-ai-engineering
+    component: api
+    managed-by: cloud-build
+  annotations:
+    # Accept traffic from the public internet (vs. internal / LB only).
+    run.googleapis.com/ingress: all
+
+spec:
+  # ── Traffic routing ──────────────────────────────────────────────────────
+  # Always send 100% to the latest revision created by this replace call.
+  traffic:
+    - percent: 100
+      latestRevision: true
+
+  template:
+    metadata:
+      # The revision name suffix is auto-generated; leave `name:` unset so
+      # each deploy creates a new, immutable revision.
+      annotations:
+        # Autoscaling bounds.
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "3"
+
+        # 2nd-gen execution environment — strongly recommended for Python
+        # apps that load heavy native deps (numpy, grpc, etc.).
+        run.googleapis.com/execution-environment: gen2
+
+        # Grant the container a full CPU during startup to cut cold-start
+        # latency (useful while uvicorn + ADK import modules).
+        run.googleapis.com/startup-cpu-boost: "true"
+
+        # CPU is only allocated while a request is in flight. Set to
+        # "true" if you need background tasks between requests (costs more).
+        run.googleapis.com/cpu-throttling: "true"
+
+        # Pin sessions to the same instance for the duration of a session
+        # cookie. Useful for stateful agent conversations.
+        run.googleapis.com/sessionAffinity: "true"
+
+    spec:
+      # Max concurrent requests per container instance. Adjust based on how
+      # CPU-bound vs IO-bound the agent is.
+      containerConcurrency: 80
+
+      # Per-request timeout (seconds). LLM calls can be slow; allow 5 min.
+      timeoutSeconds: 300
+
+      # The runtime service account. Defaults to the Compute Engine SA if
+      # omitted — uncomment and replace once you create a dedicated one.
+      # serviceAccountName: agentic-ai-runtime@PROJECT_ID.iam.gserviceaccount.com
+
+      containers:
+        # ── Main application container ────────────────────────────────────
+        - name: app
+          image: europe-west3-docker.pkg.dev/PROJECT_ID/agentic-ai-engineering/agentic-ai-engineering:latest
+
+          ports:
+            - name: http1
+              containerPort: 8080
+
+          resources:
+            limits:
+              memory: 512Mi
+              cpu: "1"
+
+          # ── Environment ─────────────────────────────────────────────────
+          env:
+            # GCP context — used by ADK, telemetry, RAG, etc.
+            - name: GOOGLE_CLOUD_PROJECT
+              value: PROJECT_ID
+            - name: GOOGLE_CLOUD_LOCATION
+              value: europe-west3
+            - name: GOOGLE_CLOUD_STORAGE_BUCKET
+              value: agentic-ai-eng-bucket-ew3
+            - name: GOOGLE_GENAI_USE_ENTERPRISE
+              value: "TRUE"
+
+            # Agent Runtime (Sessions + Memory Bank) in the same EU region.
+            - name: MEMORY_BANK_LOCATION
+              value: europe-west3
+
+            # Logging.
+            - name: LOG_LEVEL
+              value: INFO
+
+            # ADK agent defaults.
+            - name: DEFAULT_AGENT_ID
+              value: greeting_agent
+            - name: DEFAULT_LLM_MODEL
+              value: gemini-3.5-flash
+
+            # Session backend: VERTEX on Cloud Run (auto-detected via
+            # K_SERVICE), but pinned explicitly here for clarity.
+            - name: SESSION_BACKEND
+              value: VERTEX
+
+            # RAG corpus — empty means the app reuses the corpus with its
+            # display name, or creates one on first use if none exists.
+            # Pin to projects/{id}/locations/{loc}/ragCorpora/{id} once stable.
+            - name: RAG_CORPUS
+              value: ""
+
+            # Agent Runtime — empty means the app reuses the runtime named
+            # agentic-ai-engineering-memory, or creates it if none exists.
+            - name: AGENT_ENGINE_ID
+              value: ""
+
+            # ── OpenTelemetry → Cloud Trace (OTLP, telemetry.googleapis.com) ─
+            # Needs the Telemetry API enabled and roles/cloudtrace.agent (or
+            # roles/telemetry.tracesWriter) on the runtime service account.
+            # Telemetry auto-enables on Cloud Run (K_SERVICE present), but
+            # being explicit makes the behaviour visible in `gcloud run
+            # services describe`.
+            - name: OTEL_ENABLED
+              value: "true"
+            - name: OTEL_TRACES_SAMPLER_RATIO
+              value: "1.0"
+
+            # ── Secrets ──────────────────────────────────────────────────
+            # Inject a secret as an env var (the secret must already exist
+            # in Secret Manager and the runtime SA needs roles/secretmanager
+            # .secretAccessor):
+            #
+            # - name: SOME_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: some-api-key   # secret name in Secret Manager
+            #       key: latest          # version
+
+          # ── Probes ───────────────────────────────────────────────────────
+          # Cloud Run uses startup probes during cold-start and liveness
+          # probes thereafter. Both hit the FastAPI GET /health endpoint.
+          # (Avoid /healthz: Cloud Run reserves paths ending in "z" for
+          # external traffic, so it would 404 when called from outside.)
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12        # allow up to 60s for cold start
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            timeoutSeconds: 5
+            periodSeconds: 30
+            failureThreshold: 3
